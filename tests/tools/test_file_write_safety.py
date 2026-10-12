@@ -849,3 +849,65 @@ class TestMultiplexProfileWriteGuardsAreProfileScoped:
             reset_hermes_home_override(tok)
         assert err is not None
         assert "Refusing to write to Hermes config file" in err
+
+
+class TestScratchOverwriteExemption:
+    """Issue #975: write_file can overwrite a file in the agent scratch directory
+    without a prior read in that task, while workspace files remain protected."""
+
+    def test_scratch_file_overwritten_without_prior_read(self, tmp_path: Path, monkeypatch):
+        from hermes_constants import set_hermes_home_override, reset_hermes_home_override
+        from tools.file_tools import write_file_tool
+        import json
+
+        fake_home = tmp_path / "hermes_home"
+        fake_home.mkdir(parents=True)
+        token = set_hermes_home_override(str(fake_home))
+        try:
+            scratch_file = fake_home / "cache" / "scratch" / "issue-body.md"
+            scratch_file.parent.mkdir(parents=True, exist_ok=True)
+            scratch_file.write_text("initial content", encoding="utf-8")
+
+            # A fresh task with no read history overwrites the scratch file
+            res = json.loads(write_file_tool(str(scratch_file), "new content", task_id="fresh_task"))
+            assert not res.get("stale_write_blocked")
+            assert not res.get("error")
+            assert scratch_file.read_text(encoding="utf-8") == "new content"
+        finally:
+            reset_hermes_home_override(token)
+
+    def test_workspace_file_refusal_preserves_protection_and_names_remedy(self, tmp_path: Path):
+        from tools.file_tools import write_file_tool
+        import json
+
+        ws_file = tmp_path / "workspace_doc.md"
+        ws_file.write_text("initial workspace content", encoding="utf-8")
+
+        res = json.loads(write_file_tool(str(ws_file), "clobber", task_id="fresh_task"))
+        assert res.get("stale_write_blocked") is True
+        assert "scratch directory where existing files may be replaced directly" in res.get("error", "")
+        assert ws_file.read_text(encoding="utf-8") == "initial workspace content"
+
+    def test_symlink_inside_scratch_pointing_outside_cannot_bypass_guard(self, tmp_path: Path):
+        from hermes_constants import set_hermes_home_override, reset_hermes_home_override
+        from tools.file_tools import write_file_tool
+        import json
+
+        fake_home = tmp_path / "hermes_home"
+        fake_home.mkdir(parents=True)
+        outside_file = tmp_path / "secret_outside.md"
+        outside_file.write_text("protected content", encoding="utf-8")
+
+        token = set_hermes_home_override(str(fake_home))
+        try:
+            scratch_dir = fake_home / "cache" / "scratch"
+            scratch_dir.mkdir(parents=True, exist_ok=True)
+            symlink_target = scratch_dir / "symlink_escape.md"
+            symlink_target.symlink_to(outside_file)
+
+            res = json.loads(write_file_tool(str(symlink_target), "clobber", task_id="fresh_task"))
+            assert res.get("stale_write_blocked") is True
+            assert outside_file.read_text(encoding="utf-8") == "protected content"
+        finally:
+            reset_hermes_home_override(token)
+

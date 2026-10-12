@@ -134,6 +134,45 @@ def _hermes_exempt_homes() -> tuple[str, ...]:
     return (home, root) if root and root != home else (home,)
 
 
+def _agent_scratch_dirs() -> tuple[Path, ...]:
+    """Resolved scratch directories owned by the active agent session/profile(s)."""
+    resolved_dirs: list[Path] = []
+    seen: set[str] = set()
+    for home_real in _hermes_exempt_homes():
+        try:
+            cand = Path(home_real) / "cache" / "scratch"
+            r = Path(os.path.realpath(str(cand)))
+            r_str = str(r)
+            if r_str not in seen:
+                seen.add(r_str)
+                resolved_dirs.append(r)
+        except Exception:
+            continue
+    return tuple(resolved_dirs)
+
+
+def _is_agent_scratch_file(resolved: str | None) -> bool:
+    """True when *resolved* points to a file within the active agent scratch directory tree.
+
+    Scratch directories hold disposable agent output and intermediate tool state.
+    Overwriting an existing scratch file left by an earlier run does not threaten
+    user work and must not require reading it first (#975).
+    """
+    if not resolved:
+        return False
+    try:
+        real_target = Path(os.path.realpath(str(resolved)))
+    except (OSError, ValueError):
+        return False
+    for scratch_root in _agent_scratch_dirs():
+        try:
+            if real_target.is_relative_to(scratch_root) and real_target != scratch_root:
+                return True
+        except (ValueError, TypeError):
+            continue
+    return False
+
+
 def _resolved_or_raw(filepath: str, task_id: str) -> str:
     """Task-resolved path string, falling back to the raw input on resolution failure."""
     try:
@@ -510,6 +549,8 @@ def _stale_overwrite_blocker(filepath: str, resolved: str | None, task_id: str) 
             "concurrent agent). Re-read the file before writing.")
     if not resolved or _has_full_write_baseline(resolved, task_id):
         return None
+    if _is_agent_scratch_file(resolved):
+        return None
     try:
         exists = Path(resolved).exists()
     except OSError:
@@ -521,7 +562,8 @@ def _stale_overwrite_blocker(filepath: str, resolved: str | None, task_id: str) 
         "(never read, only patched, or only a redacted/partial view). Read the "
         "file — every page of it, if it needs offset/limit — or use patch for a "
         "targeted edit; a stale conversation copy must not overwrite the current "
-        "disk content.")
+        "disk content. For disposable agent output, write to the scratch directory "
+        "where existing files may be replaced directly.")
 
 
 def _stale_write_refusal(filepath: str, reason: str, resolved: str | None = None) -> dict:
