@@ -690,6 +690,104 @@ class TestProtectedInstructionFiles:
         assert rendered["choices"] == ["once", "deny"]
 
 
+class TestProfileHomeExemptsHermesRoot:
+    """issue #60: under ``hermes -p <name>`` (``HERMES_HOME=<root>/profiles/<name>``)
+    the exemption used to cover ONLY the profile dir, so the ROOT's direct files
+    (LEDGER.md / MEMORY.md / SOUL.md ...) fell through to the ``.hermes`` component
+    rule, were read as project-local ``.hermes`` config, and — having no approval
+    channel headless — failed closed. That blocked #54 (LEDGER.md edit). The gate
+    must exempt the whole Hermes tree, exactly like the default profile does.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _gate_on(self, monkeypatch):
+        import tools.file_tools_write_guards as ft
+        monkeypatch.setattr(
+            ft, "_protected_instruction_config", lambda: (True, [])
+        )
+        # The resolved-home slot is filled once per process; keep the fixture honest.
+        monkeypatch.setattr(ft, "_real_hermes_home_loaded", False)
+        monkeypatch.setattr(ft, "_real_hermes_home_cached", None)
+        yield
+
+    @pytest.fixture
+    def approvals(self, monkeypatch):
+        from tools.terminal_tool import set_approval_callback
+        state = {"calls": [], "answer": "deny"}
+
+        def cb(command, description, **kwargs):
+            state["calls"].append({"command": command, "description": description})
+            return state["answer"]
+
+        set_approval_callback(cb)
+        yield state
+        set_approval_callback(None)
+
+    def _write(self, path, content="injected"):
+        import json
+        from tools.file_tools import write_file_tool
+        return json.loads(write_file_tool(str(path), content))
+
+    def _profile_layout(self, tmp_path: Path):
+        """A real-shaped Hermes root: ``<tmp>/home/profiles/worker`` + root markers."""
+        root = tmp_path / "home"
+        profile = root / "profiles" / "worker"
+        (profile / "workspace").mkdir(parents=True)
+        (root / "config.yaml").write_text("model:\n  default: x\n", encoding="utf-8")
+        return root, profile
+
+    def test_named_profile_scope_exempts_root_direct_files(self, tmp_path, monkeypatch, approvals):
+        """Under a named profile bound by the per-turn scope (multiplex path), the ROOT's own store is
+        not project-local ``.hermes`` config: the write lands with no approval prompt."""
+        import tools.file_tools_write_guards as ft
+        from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+
+        root, profile = self._profile_layout(tmp_path)
+        monkeypatch.delenv("HERMES_HOME", raising=False)
+        token = set_hermes_home_override(str(profile))
+        try:
+            assert os.path.realpath(str(root)) in ft._hermes_exempt_homes()
+            for name in ("LEDGER.md", "MEMORY.md", "SOUL.md", "AGENTS.md"):
+                assert ft._protected_instruction_reason(str(root / name)) is None, name
+            res = self._write(root / "LEDGER.md", "caliber fixed")
+        finally:
+            reset_hermes_home_override(token)
+        assert not res.get("error"), res
+        assert (root / "LEDGER.md").read_text(encoding="utf-8") == "caliber fixed"
+        assert approvals["calls"] == []
+
+    def test_only_a_real_hermes_root_is_exempt(self, tmp_path, monkeypatch, approvals):
+        """Negatives hold with a named profile active: a checkout's ``.hermes/config.yaml`` and
+        protected basenames stay gated (fail-closed, unwritten), and a coincidental
+        ``.../profiles/<name>`` tree that is NOT a Hermes root never exempts its parent."""
+        import tools.file_tools_write_guards as ft
+        from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+
+        root, profile = self._profile_layout(tmp_path)
+        repo = tmp_path / "repo"
+        (repo / ".hermes").mkdir(parents=True)
+        monkeypatch.delenv("HERMES_HOME", raising=False)
+        token = set_hermes_home_override(str(profile))
+        try:
+            assert ft._protected_instruction_reason(str(repo / ".hermes" / "config.yaml"))
+            assert ft._protected_instruction_reason(str(repo / "AGENTS.md")) == "AGENTS.md"
+            target = repo / ".hermes" / "config.yaml"
+            res = self._write(target, "gate: off\n")
+        finally:
+            reset_hermes_home_override(token)
+        assert res.get("error") and "BLOCKED" in res["error"]
+        assert not target.exists()
+        assert len(approvals["calls"]) == 1
+
+        fake_profile = tmp_path / "not-a-hermes-root" / "profiles" / "worker"
+        fake_profile.mkdir(parents=True)
+        token = set_hermes_home_override(str(fake_profile))
+        try:
+            assert ft._hermes_exempt_homes() == (os.path.realpath(str(fake_profile)),)
+        finally:
+            reset_hermes_home_override(token)
+
+
 class TestMultiplexProfileWriteGuardsAreProfileScoped:
     """#107327: a multiplexed gateway scopes ``HERMES_HOME`` per turn via a
     contextvar. The home/config path getters must resolve per call, or whichever
@@ -751,3 +849,65 @@ class TestMultiplexProfileWriteGuardsAreProfileScoped:
             reset_hermes_home_override(tok)
         assert err is not None
         assert "Refusing to write to Hermes config file" in err
+
+
+class TestScratchOverwriteExemption:
+    """Issue #975: write_file can overwrite a file in the agent scratch directory
+    without a prior read in that task, while workspace files remain protected."""
+
+    def test_scratch_file_overwritten_without_prior_read(self, tmp_path: Path, monkeypatch):
+        from hermes_constants import set_hermes_home_override, reset_hermes_home_override
+        from tools.file_tools import write_file_tool
+        import json
+
+        fake_home = tmp_path / "hermes_home"
+        fake_home.mkdir(parents=True)
+        token = set_hermes_home_override(str(fake_home))
+        try:
+            scratch_file = fake_home / "cache" / "scratch" / "issue-body.md"
+            scratch_file.parent.mkdir(parents=True, exist_ok=True)
+            scratch_file.write_text("initial content", encoding="utf-8")
+
+            # A fresh task with no read history overwrites the scratch file
+            res = json.loads(write_file_tool(str(scratch_file), "new content", task_id="fresh_task"))
+            assert not res.get("stale_write_blocked")
+            assert not res.get("error")
+            assert scratch_file.read_text(encoding="utf-8") == "new content"
+        finally:
+            reset_hermes_home_override(token)
+
+    def test_workspace_file_refusal_preserves_protection_and_names_remedy(self, tmp_path: Path):
+        from tools.file_tools import write_file_tool
+        import json
+
+        ws_file = tmp_path / "workspace_doc.md"
+        ws_file.write_text("initial workspace content", encoding="utf-8")
+
+        res = json.loads(write_file_tool(str(ws_file), "clobber", task_id="fresh_task"))
+        assert res.get("stale_write_blocked") is True
+        assert "scratch directory where existing files may be replaced directly" in res.get("error", "")
+        assert ws_file.read_text(encoding="utf-8") == "initial workspace content"
+
+    def test_symlink_inside_scratch_pointing_outside_cannot_bypass_guard(self, tmp_path: Path):
+        from hermes_constants import set_hermes_home_override, reset_hermes_home_override
+        from tools.file_tools import write_file_tool
+        import json
+
+        fake_home = tmp_path / "hermes_home"
+        fake_home.mkdir(parents=True)
+        outside_file = tmp_path / "secret_outside.md"
+        outside_file.write_text("protected content", encoding="utf-8")
+
+        token = set_hermes_home_override(str(fake_home))
+        try:
+            scratch_dir = fake_home / "cache" / "scratch"
+            scratch_dir.mkdir(parents=True, exist_ok=True)
+            symlink_target = scratch_dir / "symlink_escape.md"
+            symlink_target.symlink_to(outside_file)
+
+            res = json.loads(write_file_tool(str(symlink_target), "clobber", task_id="fresh_task"))
+            assert res.get("stale_write_blocked") is True
+            assert outside_file.read_text(encoding="utf-8") == "protected content"
+        finally:
+            reset_hermes_home_override(token)
+
